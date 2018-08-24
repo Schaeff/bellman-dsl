@@ -1,0 +1,9 @@
+[package]
+name = "bellman-fun"
+version = "0.1.0"
+authors = ["schaeff <thibaut@schaeff.fr>"]
+
+[dependencies]
+bellman = "0.1.0"
+pairing = "0.14.2"
+rand = "0.4"
