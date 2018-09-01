@@ -31,347 +31,186 @@ struct AssignedVariable<E: Engine> {
     value: E::Fr,
 }
 
-// data structure to hold a Linear Combination of variables, with its value.
-// it's also fine to clone these
-#[derive(Clone)]
-struct AssignedLinearCombination<E: Engine> {
-    combination: LinearCombination<E>,
-    value: E::Fr,
-}
-
-// an AssignedVariable can be turned into an AssignedLinearCombination
-impl<E: Engine> From<AssignedVariable<E>> for AssignedLinearCombination<E> {
-    fn from(assigned_variable: AssignedVariable<E>) -> Self {
-        AssignedLinearCombination {
-            combination: LinearCombination::zero() + assigned_variable.variable,
-            value: assigned_variable.value,
-        }
-    }
-}
-
-// data structure to hold the binding between a typed DSL expression and its underlying
-// representation in the constraint system, in the form of many AssignedLinearCombinations
-#[derive(Clone)]
-struct TypedBinding<E: Engine> {
-    lcs: Vec<AssignedLinearCombination<E>>,
-    _type: Type,
-}
-
-// convenience function to navigate between those data structures
-impl<E: Engine> TypedBinding<E> {
-    fn field_element<T: Into<AssignedLinearCombination<E>>>(lcs: Vec<T>) -> Self {
-        TypedBinding {
-            lcs: lcs.into_iter().map(|l| l.into()).collect(),
-            _type: Type::FieldElement,
-        }
-    }
-}
-
-// the types we support: field elements, and arrays of field elements
-// we do not enforce a static size on the array just yet
-#[derive(Clone)]
-enum Type {
-    FieldElement,
-    FeArray,
-}
-
-// a typed argument to a function, like: `a: field[]`
-struct Argument {
-    name: String,
-    _type: Type,
-}
-
-impl Argument {
-    pub fn field_element<S: Into<String>>(name: S) -> Self {
-        Argument {
-            name: name.into(),
-            _type: Type::FieldElement,
-        }
-    }
-}
-
 // data structures for a program
 // we don't want to clone these as they contain strings
-struct Program<E: Engine> {
-    main: Function<E>,
-    functions: Vec<Function<E>>,
+struct Program<'a, E: Engine> {
+    main: &'a Function<'a, E>,
 }
 
-struct Function<E: Engine> {
+struct Function<'a, E: Engine> {
     id: String,
-    arguments: Vec<Argument>,
-    statements: Vec<Statement<E>>,
+    arguments: Vec<String>,
+    statements: Vec<Statement<'a, E>>,
+    return_variables: Vec<String>
 }
 
-enum Statement<E: Engine> {
-    Definition(String, Expression<E>),
-    Return(Expression<E>),
+enum Solver {
+    Three,
+    PlusOne,
 }
 
-enum Expression<E: Engine> {
-    FieldElement(FieldElementExpression<E>),
-    FeArray(FeArrayExpression<E>),
-}
-
-impl<E: Engine> From<FieldElementExpression<E>> for Expression<E> {
-    fn from(fe: FieldElementExpression<E>) -> Self {
-        Expression::FieldElement(fe)
+impl Solver {
+    fn execute<E: Engine>(&self, args: &[E::Fr]) -> Vec<E::Fr> {
+        match *self {
+            Solver::Three => vec![number_to_fr::<E>(3)],
+            Solver::PlusOne => {
+                let mut res = args[0];
+                res.add_assign(&number_to_fr::<E>(1));
+                vec![res]
+            }
+        }
     }
 }
 
-impl<E: Engine> From<FeArrayExpression<E>> for Expression<E> {
-    fn from(fea: FeArrayExpression<E>) -> Self {
-        Expression::FeArray(fea)
-    }
-}
-
-// a field element expression can be reduced in different ways
-enum FieldElementExpression<E: Engine> {
-    Number(E::Fr),
-    Add(
-        Box<FieldElementExpression<E>>,
-        Box<FieldElementExpression<E>>,
+enum Statement<'a, E: Engine> {
+    // constrain a relationship between some variables
+    Constraint(
+        Vec<(E::Fr, String)>,
+        Vec<(E::Fr, String)>,
+        Vec<(E::Fr, String)>,
     ),
-    Identifier(String),
-    FunctionCall(String, Vec<Expression<E>>), // no arguments, one return value
+    // set some new variables to some values
+    Directive(Vec<String>, Vec<String>, Solver),
+    // call a function and assign the results to some new variables
+    Definition(Vec<String>, FunctionCall<'a, E>),
 }
 
-// an array must be a constant for now
-enum FeArrayExpression<E: Engine> {
-    Constant(Vec<E::Fr>),
-}
+struct FunctionCall<'a, E: Engine>(&'a Function<'a, E>, Vec<String>);
 
-impl<E: Engine> Expression<E> {
+impl<'a, E: Engine> Statement<'a, E> {
     fn flatten<CS: ConstraintSystem<E>>(
         &self,
         cs: &mut CS,
-        context: &[Function<E>],
-        symbols: &mut HashMap<String, TypedBinding<E>>,
-    ) -> Result<TypedBinding<E>, SynthesisError> {
+        symbols: &mut HashMap<String, AssignedVariable<E>>,
+    ) -> Result<(), SynthesisError> {
         match *self {
-            Expression::FieldElement(ref e) => e.flatten(cs, context, symbols),
-            Expression::FeArray(ref e) => e.flatten(cs),
-        }
-    }
-}
-
-impl<E: Engine> FieldElementExpression<E> {
-    fn flatten<CS: ConstraintSystem<E>>(
-        &self,
-        cs: &mut CS,
-        context: &[Function<E>],
-        symbols: &mut HashMap<String, TypedBinding<E>>,
-    ) -> Result<TypedBinding<E>, SynthesisError> {
-        match *self {
-            FieldElementExpression::Number(n) => {
-                let var = cs.alloc(|| n.to_string(), || Ok(n))?;
-
-                Ok(TypedBinding::field_element(vec![AssignedVariable {
-                    variable: var,
-                    value: n,
-                }]))
-            }
-            FieldElementExpression::Identifier(ref id) => {
-                let assigned_variable = symbols.get(id).ok_or(SynthesisError::AssignmentMissing)?;
-
-                Ok((*assigned_variable).clone())
-            }
-            FieldElementExpression::FunctionCall(ref f_id, ref arguments) => {
-                let fun = context
-                    .iter()
-                    .find(|f| &f.id == f_id)
-                    .expect("undefined function");
-
+            Statement::Definition(ref output_names, FunctionCall(ref fun, ref input_names)) => {
                 let mut inputs = vec![];
-                for arg in arguments {
-                    let assigned_variable = arg.flatten(cs, context, symbols)?;
+                for name in input_names {
+                    let assigned_variable = symbols.get(name).unwrap();
 
-                    inputs.push(assigned_variable);
+                    inputs.push(assigned_variable.clone());
                 }
 
-                let assigned_output = fun.flatten(cs, context, &inputs)?;
-
-                Ok(assigned_output)
-            }
-            FieldElementExpression::Add(ref a, ref b) => {
-                // naive approach: create a new wire for each term in the sum
-
-                let assigned_variable_a = a.flatten(cs, context, symbols)?;
-
-                let assigned_variable_b = b.flatten(cs, context, symbols)?;
-
-                let assigned_variable_a = &assigned_variable_a.lcs[0];
-
-                let assigned_variable_b = &assigned_variable_b.lcs[0];
-
-                let mut res = assigned_variable_a.value;
-                res.add_assign(&assigned_variable_b.value);
-
-                let sum = cs.alloc(|| "sum", || Ok(res))?;
-
-                // CONSTRAINT
-                cs.enforce(
-                    || "res = a + b",
-                    |lc| lc + sum,
-                    |lc| lc + CS::one(),
-                    |lc| lc + &assigned_variable_a.combination + &assigned_variable_b.combination,
-                );
-
-                Ok(TypedBinding::field_element(vec![AssignedVariable {
-                    variable: sum,
-                    value: res,
-                }]))
-            }
-        }
-    }
-}
-
-impl<E: Engine> FeArrayExpression<E> {
-    fn flatten<CS: ConstraintSystem<E>>(
-        &self,
-        cs: &mut CS,
-    ) -> Result<TypedBinding<E>, SynthesisError> {
-        match *self {
-            FeArrayExpression::Constant(ref values) => {
-                let mut res = vec![];
-                for v in values {
-                    let var = cs.alloc(|| v.to_string(), || Ok(*v))?;
-                    res.push(
-                        AssignedVariable {
-                            variable: var,
-                            value: *v,
-                        }.into(),
-                    );
-                }
-
-                Ok(TypedBinding {
-                    lcs: res,
-                    _type: Type::FeArray,
-                })
-            }
-        }
-    }
-}
-
-impl<E: Engine> Statement<E> {
-    fn flatten<CS: ConstraintSystem<E>>(
-        &self,
-        cs: &mut CS,
-        context: &[Function<E>],
-        symbols: &mut HashMap<String, TypedBinding<E>>,
-        is_main: bool,
-    ) -> Result<Option<TypedBinding<E>>, SynthesisError> {
-        match *self {
-            Statement::Definition(ref id, ref e) => {
-                // condense right side into one wire with a value
-                let binding = e.flatten(cs, context, symbols)?;
+                let assigned_outputs = fun.flatten(cs, &inputs)?;
 
                 // no need to create a new variable, just register `id` is worth e.flattened
-
-                symbols.insert(id.clone(), binding);
-
-                Ok(None)
-            }
-            Statement::Return(ref e) => {
-                // condense right side into one wire with a value
-                let binding = e.flatten(cs, context, symbols)?;
-
-                let out = if is_main {
-                    let mut res = vec![];
-                    for c in binding.lcs {
-                        // if we're in the main function, we need to make the return variable a public input in the CS
-                        let out = cs.alloc_input(|| "out", || Ok(c.value))?;
-
-                        // CONSTRAINT
-                        cs.enforce(
-                            || "out = e * ~one",
-                            |lc| lc + &c.combination,
-                            |lc| lc + CS::one(),
-                            |lc| lc + out,
-                        );
-                        res.push(
-                            AssignedVariable {
-                                variable: out,
-                                value: c.value,
-                            }.into(),
-                        )
-                    }
-
-                    TypedBinding {
-                        lcs: res,
-                        ..binding
-                    }
+                for (index, assignment) in assigned_outputs.iter().enumerate() {
+                    symbols.insert(output_names[index].clone(), assignment.clone());
                 }
-                // otherwise, we already have everything we need to return
-                else {
-                    binding
-                };
+            }
+            Statement::Directive(ref var_names, ref arguments, ref solver) => {
+                // get argument values
+                let argument_values = &arguments
+                    .iter()
+                    .map(|a| symbols.get(a).unwrap().value)
+                    .collect::<Vec<_>>();
 
-                Ok(Some(out))
+                // apply solver to find result
+                let res = solver.execute::<E>(&argument_values);
+
+                for (index, r) in res.iter().enumerate() {
+                    let var = cs.alloc(|| "directive result", || Ok(*r))?;
+                    symbols.insert(
+                        var_names[index].clone(),
+                        AssignedVariable {
+                            variable: var,
+                            value: *r,
+                        },
+                    );
+                }
+            }
+            Statement::Constraint(ref a, ref b, ref c) => {
+                let a_comb = a
+                    .iter()
+                    .map(|(mult, var)| (*mult, symbols.get(var).unwrap().variable))
+                    .fold(LinearCombination::zero(), |acc, term| acc + term);
+                let b_comb = b
+                    .iter()
+                    .map(|(mult, var)| (*mult, symbols.get(var).unwrap().variable))
+                    .fold(LinearCombination::zero(), |acc, term| acc + term);
+                let c_comb = c
+                    .iter()
+                    .map(|(mult, var)| (*mult, symbols.get(var).unwrap().variable))
+                    .fold(LinearCombination::zero(), |acc, term| acc + term);
+
+                cs.enforce(
+                    || "inline constraint",
+                    |lc| lc + &a_comb,
+                    |lc| lc + &b_comb,
+                    |lc| lc + &c_comb,
+                );
             }
         }
+        Ok(())
     }
 }
 
-impl<E: Engine> Function<E> {
+impl<'a, E: Engine> Function<'a, E> {
     fn flatten<CS: ConstraintSystem<E>>(
         &self,
         cs: &mut CS,
-        context: &[Function<E>],
-        arguments: &[TypedBinding<E>],
-    ) -> Result<TypedBinding<E>, SynthesisError> {
+        arguments: &[AssignedVariable<E>],
+    ) -> Result<Vec<AssignedVariable<E>>, SynthesisError> {
         let mut cs = &mut cs.namespace(|| self.id.to_string());
 
         // map from identifier to CS wire
         let mut symbols = HashMap::new();
 
-        for (i, binding) in arguments.iter().enumerate() {
-            let mut res = vec![];
+        symbols.insert(
+            "~one".to_string(),
+            AssignedVariable {
+                variable: CS::one(),
+                value: number_to_fr::<E>(1),
+            },
+        );
 
-            for c in &binding.lcs {
-                let input = cs.alloc(|| format!("input {}", i), || Ok(c.value))?;
-
-                cs.enforce(
-                    || "arg = passed_arg",
-                    |lc| lc + input,
-                    |lc| lc + CS::one(),
-                    |lc| lc + &c.combination,
-                );
-
-                res.push(
-                    AssignedVariable {
-                        variable: input,
-                        value: c.value,
-                    }.into(),
-                );
-            }
-
-            symbols.insert(
-                self.arguments[i].name.clone(),
-                TypedBinding {
-                    lcs: res,
-                    ..binding.clone()
-                },
-            );
+        for (i, assignment) in arguments.iter().enumerate() {
+            symbols.insert(self.arguments[i].clone(), assignment.clone());
         }
 
         let is_main = self.id == "main";
 
         for statement in &self.statements {
-            match statement.flatten(&mut cs, &context, &mut symbols, is_main) {
-                Ok(Some(res)) => return Ok(res),
-                Ok(None) => {}
-                Err(e) => return Err(e),
-            }
+            statement.flatten(&mut cs, &mut symbols)?;
         }
 
-        Err(SynthesisError::AssignmentMissing)
+        let assignments: Vec<AssignedVariable<E>> =
+            self.return_variables.iter().map(|e| symbols.get(e).unwrap().clone()).collect();
+
+        let out = if is_main {
+            assignments
+                .iter()
+                .map(|a| {
+                    // if we're in the main function, we need to make the return variable a public input in the CS
+                    let out = cs.alloc_input(|| "out", || Ok(a.value)).unwrap();
+
+                    // CONSTRAINT
+                    cs.enforce(
+                        || "out = e * ~one",
+                        |lc| lc + a.variable,
+                        |lc| lc + CS::one(),
+                        |lc| lc + out,
+                    );
+
+                    AssignedVariable {
+                        variable: out,
+                        value: a.value,
+                    }
+                }).collect()
+        }
+        // otherwise, we already have everything we need to return
+        else {
+            assignments
+        };
+
+        Ok(out)
     }
 }
 
-impl<E: Engine> Circuit<E> for Program<E> {
+impl<'a, E: Engine> Circuit<E> for Program<'a, E> {
     fn synthesize<CS: ConstraintSystem<E>>(self, cs: &mut CS) -> Result<(), SynthesisError> {
-        match self.main.flatten(cs, &self.functions, &[]) {
+        match self.main.flatten(cs, &[]) {
             Ok(..) => Ok(()),
             Err(e) => Err(e),
         }
@@ -388,44 +227,58 @@ fn test_function_calls() {
 
     // our toy program
     // def main():
-    //    a = foo(3)
-    //    return a + 42
+    //	  # x = 3
+    //	  x == 3
+    //    a = foo(x)
+    //    return a
     //
     // def foo(b):
-    //    return b + 1
+    //	  # c = b + 1
+    //	  c == b + 1
+    //    return c
     //
     // should return 43
-    let program = Program::<Bls12> {
-        main: Function {
-            id: "main".to_string(),
-            arguments: vec![],
-            statements: vec![
-                Statement::Definition(
-                    String::from("a"),
-                    FieldElementExpression::FunctionCall(
-                        "foo".to_string(),
-                        vec![FieldElementExpression::Number(number_to_fr::<Bls12>(3)).into()],
-                    ).into(),
-                ),
-                Statement::Return(
-                    FieldElementExpression::Add(
-                        box FieldElementExpression::Identifier(String::from("a")),
-                        box FieldElementExpression::Number(number_to_fr::<Bls12>(42)),
-                    ).into(),
-                ),
-            ],
-        },
-        functions: vec![Function {
-            id: "foo".to_string(),
-            arguments: vec![Argument::field_element("b")],
-            statements: vec![Statement::Return(
-                FieldElementExpression::Add(
-                    box FieldElementExpression::Identifier(String::from("b")),
-                    box FieldElementExpression::Number(number_to_fr::<Bls12>(1)),
-                ).into(),
-            )],
-        }],
+
+    let foo = Function {
+        id: "foo".to_string(),
+        arguments: vec!["b".to_string()],
+        return_variables: vec!["c".to_string()],
+        statements: vec![
+            Statement::Directive(
+                vec![String::from("c")],
+                vec!["b".to_string()],
+                Solver::PlusOne,
+            ),
+            Statement::Constraint(
+                vec![(number_to_fr::<Bls12>(1), "c".to_string())],
+                vec![(number_to_fr::<Bls12>(1), "~one".to_string())],
+                vec![
+                    (number_to_fr::<Bls12>(1), "b".to_string()),
+                    (number_to_fr::<Bls12>(1), "~one".to_string()),
+                ],
+            ),
+        ],
     };
+
+    let main = Function {
+        id: "main".to_string(),
+        arguments: vec![],
+        return_variables: vec!["a".to_string()],
+        statements: vec![
+            Statement::Directive(vec![String::from("x")], vec![], Solver::Three),
+            Statement::Constraint(
+                vec![(number_to_fr::<Bls12>(1), "x".to_string())],
+                vec![(number_to_fr::<Bls12>(1), "~one".to_string())],
+                vec![(number_to_fr::<Bls12>(3), "~one".to_string())],
+            ),
+            Statement::Definition(
+                vec![String::from("a")],
+                FunctionCall(&foo, vec!["x".to_string()]),
+            ),
+        ],
+    };
+
+    let program = Program::<Bls12> { main: &main };
 
     println!("Creating parameters...");
 
@@ -439,37 +292,7 @@ fn test_function_calls() {
     let mut proof_vec = vec![];
 
     // Create an instance of our circuit (pass inputs, they were not needed for the setup)
-    let computation = Program::<Bls12> {
-        main: Function {
-            id: "main".to_string(),
-            arguments: vec![],
-            statements: vec![
-                Statement::Definition(
-                    String::from("a"),
-                    FieldElementExpression::FunctionCall(
-                        "foo".to_string(),
-                        vec![FieldElementExpression::Number(number_to_fr::<Bls12>(3)).into()],
-                    ).into(),
-                ),
-                Statement::Return(
-                    FieldElementExpression::Add(
-                        box FieldElementExpression::Identifier(String::from("a")),
-                        box FieldElementExpression::Number(number_to_fr::<Bls12>(42)),
-                    ).into(),
-                ),
-            ],
-        },
-        functions: vec![Function {
-            id: "foo".to_string(),
-            arguments: vec![Argument::field_element("b")],
-            statements: vec![Statement::Return(
-                FieldElementExpression::Add(
-                    box FieldElementExpression::Identifier(String::from("b")),
-                    box FieldElementExpression::Number(number_to_fr::<Bls12>(1)),
-                ).into(),
-            )],
-        }],
-    };
+    let computation = Program::<Bls12> { main: &main };
 
     // Create a groth16 proof with our parameters.
     let proof = create_random_proof(computation, &params, rng).unwrap();
@@ -479,71 +302,5 @@ fn test_function_calls() {
     let proof = Proof::read(&proof_vec[..]).unwrap();
 
     // Check the proof
-    assert!(verify_proof(&pvk, &proof, &[number_to_fr::<Bls12>(46)]).unwrap());
-}
-
-#[test]
-fn test_types() {
-    let rng = &mut thread_rng();
-
-    // our toy program
-    // def main():
-    //    return (42, 43)
-    //
-    // should return (42, 43)
-    let program = Program::<Bls12> {
-        main: Function {
-            id: "main".to_string(),
-            arguments: vec![],
-            statements: vec![Statement::Return(
-                FeArrayExpression::Constant(vec![
-                    number_to_fr::<Bls12>(42),
-                    number_to_fr::<Bls12>(43),
-                ]).into(),
-            )],
-        },
-        functions: vec![],
-    };
-
-    println!("Creating parameters...");
-
-    let params = generate_random_parameters(program, rng).unwrap();
-
-    // Prepare the verification key (for proof verification)
-    let pvk = prepare_verifying_key(&params.vk);
-
-    println!("Creating proofs...");
-
-    let mut proof_vec = vec![];
-
-    // Create an instance of our circuit (pass inputs, they were not needed for the setup)
-    let computation = Program::<Bls12> {
-        main: Function {
-            id: "main".to_string(),
-            arguments: vec![],
-            statements: vec![Statement::Return(
-                FeArrayExpression::Constant(vec![
-                    number_to_fr::<Bls12>(42),
-                    number_to_fr::<Bls12>(43),
-                ]).into(),
-            )],
-        },
-        functions: vec![],
-    };
-
-    // Create a groth16 proof with our parameters.
-    let proof = create_random_proof(computation, &params, rng).unwrap();
-
-    proof.write(&mut proof_vec).unwrap();
-
-    let proof = Proof::read(&proof_vec[..]).unwrap();
-
-    // Check the proof
-    assert!(
-        verify_proof(
-            &pvk,
-            &proof,
-            &[number_to_fr::<Bls12>(42), number_to_fr::<Bls12>(43)]
-        ).unwrap()
-    );
+    assert!(verify_proof(&pvk, &proof, &[number_to_fr::<Bls12>(4)]).unwrap());
 }
