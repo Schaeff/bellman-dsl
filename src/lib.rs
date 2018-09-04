@@ -14,7 +14,7 @@ use pairing::{Engine, Field, PrimeField};
 use pairing::bls12_381::Bls12;
 
 // We'll use these interfaces to construct our circuit.
-use bellman::{Circuit, ConstraintSystem, LinearCombination, SynthesisError, Variable};
+use bellman::{Circuit, ConstraintSystem, LinearCombination, SynthesisError};
 
 // We're going to use the Groth16 proving system.
 use bellman::groth16::{
@@ -23,13 +23,14 @@ use bellman::groth16::{
 
 use std::collections::HashMap;
 
-// data structure to hold a FieldElement variable with its value
-// it's fine to clone these
+
 #[derive(Clone)]
-struct AssignedVariable<E: Engine> {
-    variable: Variable,
-    value: E::Fr,
+struct AssignedLinearCombination<E: Engine> {
+    combination: LinearCombination<E>,
+    value: E::Fr
 }
+
+struct LinCombMemory<E: Engine>(Vec<(E::Fr, String)>);
 
 // data structures for a program
 // we don't want to clone these as they contain strings
@@ -65,9 +66,9 @@ impl Solver {
 enum Statement<'a, E: Engine> {
     // constrain a relationship between some variables
     Constraint(
-        Vec<(E::Fr, String)>,
-        Vec<(E::Fr, String)>,
-        Vec<(E::Fr, String)>,
+        LinCombMemory<E>,
+        LinCombMemory<E>,
+        LinCombMemory<E>,
     ),
     // set some new variables to some values
     Directive(Vec<String>, Vec<String>, Solver),
@@ -75,21 +76,32 @@ enum Statement<'a, E: Engine> {
     Definition(Vec<String>, FunctionCall<'a, E>),
 }
 
-struct FunctionCall<'a, E: Engine>(&'a Function<'a, E>, Vec<String>);
+struct FunctionCall<'a, E: Engine>(&'a Function<'a, E>, Vec<LinCombMemory<E>>);
 
 impl<'a, E: Engine> Statement<'a, E> {
     fn flatten<CS: ConstraintSystem<E>>(
         &self,
         cs: &mut CS,
-        symbols: &mut HashMap<String, AssignedVariable<E>>,
+        symbols: &mut HashMap<String, AssignedLinearCombination<E>>,
     ) -> Result<(), SynthesisError> {
         match *self {
-            Statement::Definition(ref output_names, FunctionCall(ref fun, ref input_names)) => {
+            Statement::Definition(ref output_names, FunctionCall(ref fun, ref combs)) => {
                 let mut inputs = vec![];
-                for name in input_names {
-                    let assigned_variable = symbols.get(name).unwrap();
+                for comb in combs {
+                    let mut c = LinearCombination::zero();
+                    let mut value = E::Fr::zero();
+                    for (mult, var) in comb.0.iter() {
+                        let assigned_variable = symbols.get(var).unwrap();
+                        let mut v = assigned_variable.value;
+                        v.mul_assign(&mult);
+                        c = c + (*mult, &assigned_variable.combination);
+                        value.add_assign(&v);
+                    } 
 
-                    inputs.push(assigned_variable.clone());
+                    inputs.push(AssignedLinearCombination {
+                        combination: c,
+                        value: value
+                    });
                 }
 
                 let assigned_outputs = fun.flatten(cs, &inputs)?;
@@ -113,25 +125,25 @@ impl<'a, E: Engine> Statement<'a, E> {
                     let var = cs.alloc(|| "directive result", || Ok(*r))?;
                     symbols.insert(
                         var_names[index].clone(),
-                        AssignedVariable {
-                            variable: var,
+                        AssignedLinearCombination {
+                            combination: LinearCombination::zero() + var,
                             value: *r,
                         },
                     );
                 }
             }
             Statement::Constraint(ref a, ref b, ref c) => {
-                let a_comb = a
+                let a_comb = a.0
                     .iter()
-                    .map(|(mult, var)| (*mult, symbols.get(var).unwrap().variable))
+                    .map(|(mult, var)| (*mult, &symbols.get(var).unwrap().combination))
                     .fold(LinearCombination::zero(), |acc, term| acc + term);
-                let b_comb = b
+                let b_comb = b.0
                     .iter()
-                    .map(|(mult, var)| (*mult, symbols.get(var).unwrap().variable))
+                    .map(|(mult, var)| (*mult, &symbols.get(var).unwrap().combination))
                     .fold(LinearCombination::zero(), |acc, term| acc + term);
-                let c_comb = c
+                let c_comb = c.0
                     .iter()
-                    .map(|(mult, var)| (*mult, symbols.get(var).unwrap().variable))
+                    .map(|(mult, var)| (*mult, &symbols.get(var).unwrap().combination))
                     .fold(LinearCombination::zero(), |acc, term| acc + term);
 
                 cs.enforce(
@@ -150,8 +162,8 @@ impl<'a, E: Engine> Function<'a, E> {
     fn flatten<CS: ConstraintSystem<E>>(
         &self,
         cs: &mut CS,
-        arguments: &[AssignedVariable<E>],
-    ) -> Result<Vec<AssignedVariable<E>>, SynthesisError> {
+        arguments: &[AssignedLinearCombination<E>],
+    ) -> Result<Vec<AssignedLinearCombination<E>>, SynthesisError> {
         let mut cs = &mut cs.namespace(|| self.id.to_string());
 
         // map from identifier to CS wire
@@ -159,10 +171,10 @@ impl<'a, E: Engine> Function<'a, E> {
 
         symbols.insert(
             "~one".to_string(),
-            AssignedVariable {
-                variable: CS::one(),
-                value: number_to_fr::<E>(1),
-            },
+            AssignedLinearCombination {
+                combination: LinearCombination::zero() + CS::one(),
+                value: number_to_fr::<E>(1)
+            }
         );
 
         for (i, assignment) in arguments.iter().enumerate() {
@@ -175,7 +187,7 @@ impl<'a, E: Engine> Function<'a, E> {
             statement.flatten(&mut cs, &mut symbols)?;
         }
 
-        let assignments: Vec<AssignedVariable<E>> =
+        let assignments: Vec<AssignedLinearCombination<E>> =
             self.return_variables.iter().map(|e| symbols.get(e).unwrap().clone()).collect();
 
         let out = if is_main {
@@ -188,13 +200,13 @@ impl<'a, E: Engine> Function<'a, E> {
                     // CONSTRAINT
                     cs.enforce(
                         || "out = e * ~one",
-                        |lc| lc + a.variable,
+                        |lc| lc + &a.combination,
                         |lc| lc + CS::one(),
                         |lc| lc + out,
                     );
 
-                    AssignedVariable {
-                        variable: out,
+                    AssignedLinearCombination {
+                        combination: LinearCombination::zero() + out,
                         value: a.value,
                     }
                 }).collect()
@@ -250,12 +262,12 @@ fn test_function_calls() {
                 Solver::PlusOne,
             ),
             Statement::Constraint(
-                vec![(number_to_fr::<Bls12>(1), "c".to_string())],
-                vec![(number_to_fr::<Bls12>(1), "~one".to_string())],
-                vec![
+                LinCombMemory(vec![(number_to_fr::<Bls12>(1), "c".to_string())]),
+                LinCombMemory(vec![(number_to_fr::<Bls12>(1), "~one".to_string())]),
+                LinCombMemory(vec![
                     (number_to_fr::<Bls12>(1), "b".to_string()),
                     (number_to_fr::<Bls12>(1), "~one".to_string()),
-                ],
+                ]),
             ),
         ],
     };
@@ -267,13 +279,13 @@ fn test_function_calls() {
         statements: vec![
             Statement::Directive(vec![String::from("x")], vec![], Solver::Three),
             Statement::Constraint(
-                vec![(number_to_fr::<Bls12>(1), "x".to_string())],
-                vec![(number_to_fr::<Bls12>(1), "~one".to_string())],
-                vec![(number_to_fr::<Bls12>(3), "~one".to_string())],
+                LinCombMemory(vec![(number_to_fr::<Bls12>(1), "x".to_string())]),
+                LinCombMemory(vec![(number_to_fr::<Bls12>(1), "~one".to_string())]),
+                LinCombMemory(vec![(number_to_fr::<Bls12>(3), "~one".to_string())]),
             ),
             Statement::Definition(
                 vec![String::from("a")],
-                FunctionCall(&foo, vec!["x".to_string()]),
+                FunctionCall(&foo, vec![LinCombMemory(vec![(number_to_fr::<Bls12>(1), "x".to_string())])]),
             ),
         ],
     };
